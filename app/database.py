@@ -77,7 +77,7 @@ def add_pending(user_id: str, amount: float, description: str, image_url: str,
     return pending_id
 
 
-def get_pending(user_id: str) -> dict | None:
+def get_pending(user_id: str):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -92,9 +92,18 @@ def get_pending(user_id: str) -> dict | None:
 def update_pending_state(user_id: str, state: str) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
+    # Get the latest pending ID first (SQLite does not support ORDER BY in UPDATE)
     cursor.execute(
-        "UPDATE pending_transactions SET state = ? WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
-        (state, user_id),
+        "SELECT id FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+    cursor.execute(
+        "UPDATE pending_transactions SET state = ? WHERE id = ?",
+        (state, row["id"]),
     )
     conn.commit()
     updated = cursor.rowcount > 0
@@ -105,10 +114,16 @@ def update_pending_state(user_id: str, state: str) -> bool:
 def delete_pending(user_id: str) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
+    # Get the latest pending ID first (SQLite does not support ORDER BY in DELETE on all versions)
     cursor.execute(
-        "DELETE FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False
+    cursor.execute("DELETE FROM pending_transactions WHERE id = ?", (row["id"],))
     conn.commit()
     deleted = cursor.rowcount > 0
     conn.close()
