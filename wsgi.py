@@ -1,16 +1,12 @@
-import sys
+"""WSGI entry point for PythonAnywhere."""
 import os
+import sys
 
-# Add the project directory to the sys.path
-path = os.path.dirname(os.path.abspath(__file__))
-if path not in sys.path:
-    sys.path.append(path)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from app.main import app
-```python
-# We wrap the FastAPI app to make it WSGI compatible for PythonAnywhere
 from fastapi.wsgi import WSGIMiddleware
 
-# Use the WSGI middleware to wrap the FastAPI app
 application = WSGIMiddleware(app)
-```

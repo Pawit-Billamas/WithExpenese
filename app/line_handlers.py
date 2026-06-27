@@ -1,8 +1,7 @@
 import io
 import csv
 import re
-import asyncio
-import httpx
+import urllib.request
 from fastapi import Request
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -31,13 +30,12 @@ configuration = Configuration(access_token=settings.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(channel_secret=settings.LINE_CHANNEL_SECRET)
 
 
-async def get_image_content(message_id: str) -> bytes:
+def get_image_content(message_id: str) -> bytes:
+    """Download image bytes from LINE (synchronous, no extra deps)."""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(url, headers=headers)
-        resp.raise_for_status()
-        return resp.content
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read()
 
 
 def build_category_quick_reply(categories: list[str]) -> QuickReply:
@@ -155,15 +153,13 @@ def handle_text_message(event: MessageEvent):
 
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image_message(event: MessageEvent):
+    """Process slip image - manual amount entry (no OCR)."""
     user_id = event.source.user_id
-    message_id = event.message.id
     reply_token = event.reply_token
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(_process_image(user_id, message_id, reply_token))
-    finally:
-        loop.close()
+    db.add_pending(user_id, 0, "Slip photo", "", "Awaiting manual amount")
+    _reply(reply_token, [TextMessage(
+        text="📸 Image received!\n\nType amount:\nedit [amount]\n\nExample: edit 140"
+    )])
 
 
 
