@@ -1,0 +1,36 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Test files
+test_*.py
+add_tesseract_path.ps1
+install_all.ps1
