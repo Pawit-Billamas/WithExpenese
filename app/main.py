@@ -18,15 +18,25 @@ def startup():
     print("✅ Database initialized.")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
-    """Health check."""
-    return {"status": "ok", "message": "Expense Tracker Bot is running."}
+    """Health check. Also reports OCR/QR readiness so a single GET / tells you
+    whether slip reading will work (no need to open /ocr-status separately).
+    Accepts HEAD too, so Render's health probe doesn't log 405s."""
+    from app.ocr_service import get_status
+    ocr = get_status()
+    return {
+        "status": "ok",
+        "message": "Expense Tracker Bot is running.",
+        "ocr_available": ocr.get("available"),
+        "ocr_lang": ocr.get("lang"),
+        "qr_fallback": ocr.get("qr_fallback"),
+    }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
-    """Health check for UptimeRobot / monitoring."""
+    """Health check for UptimeRobot / monitoring / Render probe."""
     return {"status": "healthy"}
 
 
