@@ -196,21 +196,34 @@ def handle_image(event: MessageEvent):
     if amount and amount > 0:
         db.add_pending(user_id, amount, "", "", ocr_result.get("raw_text", ""))
         db.update_pending_state(user_id, "awaiting_description")
+        via = " (via QR)" if ocr_result.get("source") == "qr" else ""
         _reply(token, [TextMessage(
-            text=f"📸 Slip read!\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. coffee, taxi, lunch)"
+            text=f"📸 Slip read!{via}\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. coffee, taxi, lunch)"
         )])
     else:
         # Show first 10 lines of what Tesseract actually read so we can debug
         debug_lines = ocr_result.get("debug_lines", [])
         preview = "\n".join(ln for ln in debug_lines[:12] if ln.strip()) or "(nothing read)"
         db.add_pending(user_id, 0, "", "", "")
-        _reply(token, [TextMessage(
-            text=(
+
+        # If OCR failed but we decoded the slip QR, show its reference so the
+        # user knows the slip was recognized (Thai verify-QRs rarely carry the
+        # amount, so we still ask them to confirm it).
+        qr_ref = ocr_result.get("qr_reference", "")
+        if ocr_result.get("qr_found") and qr_ref:
+            body = (
+                "📸 Got the slip — read the QR code ✅\n"
+                f"🔖 Ref: {qr_ref}\n\n"
+                "The amount isn't stored in the QR. Please type it:\n"
+                "edit [amount]\nExample: edit 200"
+            )
+        else:
+            body = (
                 "📸 Got the slip — couldn't detect the amount.\n\n"
                 f"🔍 OCR read:\n{preview}\n\n"
                 "Please type the amount manually:\nedit [amount]\nExample: edit 200"
             )
-        )])
+        _reply(token, [TextMessage(text=body)])
 
 
 # ── Flow steps ────────────────────────────────────────────────────────

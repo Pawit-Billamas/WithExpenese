@@ -195,35 +195,64 @@ def _extract_amount(text: str):
 # ── Core OCR runner (sync) ────────────────────────────────────────────
 
 def _run_ocr(image_bytes: bytes) -> dict:
-    if not TESSERACT_AVAILABLE:
-        err = _SETUP_ERROR if "_SETUP_ERROR" in dir() else "Tesseract not installed"
-        return {"amount": None, "raw_text": f"[Setup error] {err}",
-                "debug_lines": [f"[Setup error] {err}"]}
-
     if not image_bytes:
-        return {"amount": None, "raw_text": "No image", "debug_lines": []}
+        return {"amount": None, "raw_text": "No image", "debug_lines": [],
+                "source": "none"}
 
+    last_text = ""
+
+    # Try Tesseract first (when available). If it's missing (e.g. not installed
+    # on the server), we skip straight to the QR fallback below instead of
+    # bailing out — that's what lets the bot still work without Tesseract.
+    if TESSERACT_AVAILABLE:
+        try:
+            variants = _preprocess_variants(image_bytes)
+            for img in variants:
+                for psm in (6, 4, 11):
+                    cfg = f"--psm {psm} --oem 3 -l {OCR_LANG}"
+                    text = pytesseract.image_to_string(img, config=cfg)
+                    last_text = text or last_text
+                    amount = _extract_amount(text)
+                    if amount is not None:
+                        return {"amount": amount, "raw_text": text,
+                                "debug_lines": text.splitlines(), "source": "ocr"}
+        except Exception as e:
+            print(f"[OCR Error] {e}")
+            last_text = last_text or f"[OCR Error] {e}"
+    else:
+        last_text = f"[Tesseract unavailable] {_SETUP_ERROR}"
+
+    # ── Fallback: QR code ────────────────────────────────────────────
+    # Runs when Tesseract is unavailable OR OCR found no amount.
+    return _qr_fallback(image_bytes, last_text)
+
+
+def _qr_fallback(image_bytes: bytes, last_text: str) -> dict:
+    """Try to read the slip's QR when OCR could not produce an amount."""
     try:
-        variants = _preprocess_variants(image_bytes)
-        last_text = ""
-
-        for img in variants:
-            for psm in (6, 4, 11):
-                cfg = f"--psm {psm} --oem 3 -l {OCR_LANG}"
-                text = pytesseract.image_to_string(img, config=cfg)
-                last_text = text or last_text
-                amount = _extract_amount(text)
-                if amount is not None:
-                    return {"amount": amount, "raw_text": text,
-                            "debug_lines": text.splitlines()}
-
-        return {"amount": None, "raw_text": last_text,
-                "debug_lines": last_text.splitlines()}
-
+        from app.qr_service import read_qr
+        qr = read_qr(image_bytes)
     except Exception as e:
-        print(f"[OCR Error] {e}")
-        return {"amount": None, "raw_text": f"[OCR Error] {e}",
-                "debug_lines": [f"[OCR Error] {e}"]}
+        print(f"[QR fallback error] {e}")
+        qr = {"found": False, "amount": None, "reference": "", "raw": ""}
+
+    if qr.get("amount"):
+        return {
+            "amount": qr["amount"],
+            "raw_text": last_text,
+            "debug_lines": (last_text.splitlines() if last_text else []),
+            "source": "qr",
+            "qr_reference": qr.get("reference", ""),
+        }
+
+    return {
+        "amount": None,
+        "raw_text": last_text,
+        "debug_lines": (last_text.splitlines() if last_text else []),
+        "source": "qr" if qr.get("found") else "ocr",
+        "qr_found": bool(qr.get("found")),
+        "qr_reference": qr.get("reference", ""),
+    }
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -245,17 +274,28 @@ async def ocr_slip_image(image_bytes: bytes) -> dict:
 
 
 def get_status() -> dict:
-    """Return Tesseract availability info — used by /ocr-status endpoint."""
+    """Return OCR + QR availability info — used by /ocr-status endpoint."""
+    try:
+        from app.qr_service import QR_AVAILABLE, _QR_SETUP_ERROR
+    except Exception as e:
+        QR_AVAILABLE, _QR_SETUP_ERROR = False, str(e)
+
+    qr_info = {"qr_fallback": QR_AVAILABLE}
+    if not QR_AVAILABLE:
+        qr_info["qr_error"] = _QR_SETUP_ERROR
+
     if TESSERACT_AVAILABLE:
         return {
             "available": True,
             "path": pytesseract.pytesseract.tesseract_cmd,
             "version": str(pytesseract.get_tesseract_version()),
             "lang": OCR_LANG,
+            **qr_info,
         }
     return {
         "available": False,
         "error": _SETUP_ERROR or "Tesseract binary not found on the server.",
         "lang": OCR_LANG,
         "langs_found": sorted(_LANGS),
+        **qr_info,
     }
