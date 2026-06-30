@@ -40,10 +40,11 @@ def _get_image_bytes(message_id: str) -> bytes:
         return resp.read()
 
 
-def _build_category_quick_reply(categories: list[str]) -> QuickReply:
+def _build_category_quick_reply(categories: list[str], include_edit_amount: bool = True) -> QuickReply:
     items = [QuickReplyItem(action=MessageAction(label=c, text=c)) for c in categories[:8]]
     items.append(QuickReplyItem(action=MessageAction(label="➕ New", text="➕ New Category")))
-    items.append(QuickReplyItem(action=MessageAction(label="✏️ Edit amount", text="edit")))
+    if include_edit_amount:
+        items.append(QuickReplyItem(action=MessageAction(label="✏️ Edit amount", text="edit")))
     items.append(QuickReplyItem(action=MessageAction(label="❌ Cancel", text="cancel")))
     return QuickReply(items=items)
 
@@ -53,6 +54,24 @@ def _action_quick_reply() -> QuickReply:
     return QuickReply(items=[
         QuickReplyItem(action=MessageAction(label="✏️ Edit amount", text="edit")),
         QuickReplyItem(action=MessageAction(label="❌ Cancel", text="cancel")),
+    ])
+
+
+def _manage_item_quick_reply() -> QuickReply:
+    """Delete / change amount / change name / change category / back buttons."""
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="🗑️ Delete", text="manage delete")),
+        QuickReplyItem(action=MessageAction(label="💰 Amount", text="manage amount")),
+        QuickReplyItem(action=MessageAction(label="📝 Name", text="manage name")),
+        QuickReplyItem(action=MessageAction(label="📂 Category", text="manage category")),
+        QuickReplyItem(action=MessageAction(label="❌ Back", text="manage")),
+    ])
+
+
+def _manage_confirm_quick_reply() -> QuickReply:
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="✅ Yes, delete", text="manage delete confirm")),
+        QuickReplyItem(action=MessageAction(label="❌ No", text="manage")),
     ])
 
 
@@ -121,9 +140,10 @@ def handle_text(event: MessageEvent):
             "   Example: cash 150\n\n"
             "📸 Send a slip photo — auto-reads amount\n\n"
             "📋 recent — last 5 transactions\n"
-            "📊 summary — monthly breakdown\n"
+            "📊 summary — this month's breakdown\n"
             "📂 categories — list categories\n"
             "📤 export — download all transactions as CSV\n"
+            "🛠️ manage — edit or delete a saved transaction\n"
             "✏️ edit [amount] — fix amount on pending slip"
         ))])
         return
@@ -144,9 +164,35 @@ def handle_text(event: MessageEvent):
         _handle_export(user_id, token)
         return
 
-    # ── cancel (discard the pending slip/transaction) ──────────────
+    # ── manage (edit/delete saved transactions) ─────────────────────
+    if text.lower() == "manage":
+        db.clear_manage_session(user_id)
+        _handle_manage_list(user_id, token)
+        return
+
+    manage_select = re.match(r"^manage\s+(\d+)$", text, re.IGNORECASE)
+    if manage_select:
+        _handle_manage_select(user_id, token, int(manage_select.group(1)))
+        return
+
+    if text.lower() == "manage delete":
+        _handle_manage_delete_confirm(user_id, token)
+        return
+
+    if text.lower() == "manage delete confirm":
+        _handle_manage_delete(user_id, token)
+        return
+
+    if text.lower() in ("manage amount", "manage name", "manage category"):
+        _handle_manage_edit_prompt(user_id, token, text.lower().split()[1])
+        return
+
+    # ── cancel (discard the pending slip/transaction or manage session) ──
     if text.lower() == "cancel":
-        if db.get_pending(user_id):
+        if db.get_manage_session(user_id):
+            db.clear_manage_session(user_id)
+            _reply(token, [TextMessage(text="❌ Cancelled.")])
+        elif db.get_pending(user_id):
             db.delete_pending(user_id)
             _reply(token, [TextMessage(text="❌ Cancelled. Nothing was saved.\nSend another slip or type 'cash 100'.")])
         else:
@@ -172,6 +218,14 @@ def handle_text(event: MessageEvent):
             _reply(token, [TextMessage(text="✏️ Type the correct amount (e.g. 100 or 100.50):")])
         else:
             _reply(token, [TextMessage(text="No pending slip. Send a slip first.")])
+        return
+
+    # ── Manage-session state machine (editing a saved transaction) ──
+    manage_session = db.get_manage_session(user_id)
+    if manage_session and manage_session["state"] in (
+        "awaiting_amount", "awaiting_name", "awaiting_category"
+    ):
+        _handle_manage_edit_input(user_id, token, manage_session, text)
         return
 
     # ── Pending-state machine ──────────────────────────────────────
@@ -411,6 +465,123 @@ def _handle_categories(user_id: str, token: str):
         return
     lines = ["📂 Categories:"] + [f"{i}. {c}" for i, c in enumerate(cats, 1)]
     _reply(token, [TextMessage(text="\n".join(lines))])
+
+
+def _format_txn_line(t: dict) -> str:
+    date = str(t["created_at"])[:10]
+    name = t["description"] or "-"
+    return f"{t['amount']:,.0f} THB | {name} | {t['category']} | {date}"
+
+
+def _handle_manage_list(user_id: str, token: str):
+    txns = db.get_recent_transactions(user_id, limit=10)
+    if not txns:
+        _reply(token, [TextMessage(text="📭 No transactions to manage.")])
+        return
+    lines = ["🛠️ Manage transactions — reply with a number:\n"]
+    for i, t in enumerate(txns, 1):
+        lines.append(f"{i}. {_format_txn_line(t)}")
+    items = [
+        QuickReplyItem(action=MessageAction(label=str(i), text=f"manage {i}"))
+        for i in range(1, len(txns) + 1)
+    ]
+    db.set_manage_session(user_id, txns[0]["id"], state="listing")
+    _reply(token, [TextMessage(text="\n".join(lines), quick_reply=QuickReply(items=items))])
+
+
+def _handle_manage_select(user_id: str, token: str, index: int):
+    txns = db.get_recent_transactions(user_id, limit=10)
+    if index < 1 or index > len(txns):
+        _reply(token, [TextMessage(text=f"Please pick a number between 1 and {len(txns)}.")])
+        return
+    t = txns[index - 1]
+    db.set_manage_session(user_id, t["id"], state="menu")
+    _reply(token, [TextMessage(
+        text=f"📝 {_format_txn_line(t)}\n\nWhat do you want to do?",
+        quick_reply=_manage_item_quick_reply(),
+    )])
+
+
+def _handle_manage_delete_confirm(user_id: str, token: str):
+    session = db.get_manage_session(user_id)
+    if not session:
+        _reply(token, [TextMessage(text="No transaction selected. Type 'manage' to start.")])
+        return
+    t = db.get_transaction(user_id, session["transaction_id"])
+    if not t:
+        db.clear_manage_session(user_id)
+        _reply(token, [TextMessage(text="That transaction no longer exists.")])
+        return
+    _reply(token, [TextMessage(
+        text=f"⚠️ Delete this transaction?\n\n{_format_txn_line(t)}",
+        quick_reply=_manage_confirm_quick_reply(),
+    )])
+
+
+def _handle_manage_delete(user_id: str, token: str):
+    session = db.get_manage_session(user_id)
+    if not session:
+        _reply(token, [TextMessage(text="No transaction selected. Type 'manage' to start.")])
+        return
+    deleted = db.delete_transaction(user_id, session["transaction_id"])
+    db.clear_manage_session(user_id)
+    if deleted:
+        _reply(token, [TextMessage(text="🗑️ Deleted.")])
+    else:
+        _reply(token, [TextMessage(text="❌ Could not delete (already removed?).")])
+
+
+def _handle_manage_edit_prompt(user_id: str, token: str, field: str):
+    session = db.get_manage_session(user_id)
+    if not session:
+        _reply(token, [TextMessage(text="No transaction selected. Type 'manage' to start.")])
+        return
+    t = db.get_transaction(user_id, session["transaction_id"])
+    if not t:
+        db.clear_manage_session(user_id)
+        _reply(token, [TextMessage(text="That transaction no longer exists.")])
+        return
+
+    if field == "amount":
+        db.set_manage_session(user_id, t["id"], state="awaiting_amount")
+        _reply(token, [TextMessage(text=f"Current amount: {t['amount']:,.0f} THB\nType the new amount:")])
+    elif field == "name":
+        db.set_manage_session(user_id, t["id"], state="awaiting_name")
+        _reply(token, [TextMessage(text=f"Current name: {t['description'] or '-'}\nType the new name:")])
+    elif field == "category":
+        db.set_manage_session(user_id, t["id"], state="awaiting_category")
+        cats = db.get_categories()
+        qr = _build_category_quick_reply(cats, include_edit_amount=False)
+        _reply(token, [TextMessage(text=f"Current category: {t['category']}\nPick a new category:", quick_reply=qr)])
+
+
+def _handle_manage_edit_input(user_id: str, token: str, session: dict, text: str):
+    field = session["state"].replace("awaiting_", "")
+    transaction_id = session["transaction_id"]
+
+    if field == "amount":
+        m = re.match(r"^(\d+(?:\.\d{1,2})?)$", text.strip())
+        if not m:
+            _reply(token, [TextMessage(text="Please type a valid number, e.g. 100 or 100.50 (or 'cancel').")])
+            return
+        db.update_transaction(user_id, transaction_id, amount=float(m.group(1)))
+    elif field == "name":
+        name = text.strip()
+        if not name:
+            _reply(token, [TextMessage(text="Please type a name (or 'cancel').")])
+            return
+        db.update_transaction(user_id, transaction_id, description=name)
+    elif field == "category":
+        cats = db.get_categories()
+        if text not in cats:
+            qr = _build_category_quick_reply(cats, include_edit_amount=False)
+            _reply(token, [TextMessage(text="Please pick a category from the list (or 'cancel').", quick_reply=qr)])
+            return
+        db.update_transaction(user_id, transaction_id, category=text)
+
+    db.clear_manage_session(user_id)
+    t = db.get_transaction(user_id, transaction_id)
+    _reply(token, [TextMessage(text=f"✅ Updated!\n\n{_format_txn_line(t)}")])
 
 
 def _handle_export(user_id: str, token: str):

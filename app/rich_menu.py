@@ -48,7 +48,7 @@ def create_rich_menu() -> str | None:
     """
     Create a 6-button rich menu (3x2 grid):
       Top:    Recent | Summary | Categories
-      Bottom: Log Cash | Send Slip (photo tip) | Export
+      Bottom: Manage | Export | Help
     """
     menu_data = {
         "size": {"width": 2500, "height": 1686},
@@ -72,15 +72,15 @@ def create_rich_menu() -> str | None:
             # ── Bottom row ────────────────────────────────────────
             {
                 "bounds": {"x": 0,    "y": 843, "width": 833, "height": 843},
-                "action": {"type": "message", "text": "cash "},   # user must add amount
+                "action": {"type": "message", "text": "manage"},
             },
             {
                 "bounds": {"x": 833,  "y": 843, "width": 834, "height": 843},
-                "action": {"type": "message", "text": "help"},
+                "action": {"type": "message", "text": "export"},
             },
             {
                 "bounds": {"x": 1667, "y": 843, "width": 833, "height": 843},
-                "action": {"type": "message", "text": "export"},
+                "action": {"type": "message", "text": "help"},
             },
         ],
     }

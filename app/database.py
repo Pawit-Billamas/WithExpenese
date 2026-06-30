@@ -75,6 +75,14 @@ def init_db():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS manage_sessions (
+            user_id        TEXT PRIMARY KEY,
+            transaction_id INTEGER NOT NULL,
+            state          TEXT NOT NULL DEFAULT 'menu'
+        )
+    """)
+
     # Seed default categories if empty
     cursor.execute("SELECT COUNT(*) FROM categories")
     if cursor.fetchone()[0] == 0:
@@ -164,6 +172,43 @@ def delete_pending(user_id: str) -> bool:
     return deleted
 
 
+# ── Manage-session helpers (edit/delete saved transactions) ───────────
+
+def set_manage_session(user_id: str, transaction_id: int, state: str = "menu") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO manage_sessions (user_id, transaction_id, state)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (user_id) DO UPDATE
+               SET transaction_id = EXCLUDED.transaction_id, state = EXCLUDED.state""",
+        (user_id, transaction_id, state),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_manage_session(user_id: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM manage_sessions WHERE user_id = %s", (user_id,))
+    row = cursor.fetchone()
+    result = _as_dict(cursor, row) if row else None
+    cursor.close()
+    conn.close()
+    return result
+
+
+def clear_manage_session(user_id: str) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM manage_sessions WHERE user_id = %s", (user_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
 # ── Category helpers ──────────────────────────────────────────────────
 
 def get_categories() -> list[str]:
@@ -243,6 +288,67 @@ def get_all_transactions(user_id: str) -> list[dict]:
     cursor.close()
     conn.close()
     return result
+
+
+def get_recent_transactions(user_id: str, limit: int = 10) -> list[dict]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT %s",
+        (user_id, limit),
+    )
+    result = _all_as_dicts(cursor)
+    cursor.close()
+    conn.close()
+    return result
+
+
+def get_transaction(user_id: str, transaction_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM transactions WHERE id = %s AND user_id = %s",
+        (transaction_id, user_id),
+    )
+    row = cursor.fetchone()
+    result = _as_dict(cursor, row) if row else None
+    cursor.close()
+    conn.close()
+    return result
+
+
+def update_transaction(user_id: str, transaction_id: int, **fields) -> bool:
+    """Update one or more columns (amount, description, category) on a transaction."""
+    allowed = {"amount", "description", "category"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return False
+    set_clause = ", ".join(f"{col} = %s" for col in fields)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE transactions SET {set_clause} WHERE id = %s AND user_id = %s",
+        (*fields.values(), transaction_id, user_id),
+    )
+    conn.commit()
+    updated = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return updated
+
+
+def delete_transaction(user_id: str, transaction_id: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM transactions WHERE id = %s AND user_id = %s",
+        (transaction_id, user_id),
+    )
+    conn.commit()
+    deleted = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return deleted
 
 
 def get_monthly_summary(user_id: str) -> list[dict]:
