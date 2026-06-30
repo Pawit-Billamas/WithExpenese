@@ -170,9 +170,9 @@ def handle_text(event: MessageEvent):
 @handler.add(MessageEvent, message=ImageMessageContent)
 def handle_image(event: MessageEvent):
     """
-    Download slip, run OCR via Gemini Vision.
+    Download slip, run Tesseract OCR.
     If amount found  → ask for item name.
-    If amount NOT found → ask user to type it with 'edit [amount]'.
+    If amount NOT found → show raw OCR snippet so user can debug, then ask for manual entry.
     """
     user_id = event.source.user_id
     token = event.reply_token
@@ -181,12 +181,12 @@ def handle_image(event: MessageEvent):
     try:
         image_bytes = _get_image_bytes(message_id)
         # Run async OCR in sync context
-        ocr_result = asyncio.get_event_loop().run_until_complete(
-            ocr_slip_image(image_bytes)
-        )
+        loop = asyncio.new_event_loop()
+        ocr_result = loop.run_until_complete(ocr_slip_image(image_bytes))
+        loop.close()
     except Exception as e:
-        print(f"[Image Download Error] {e}")
-        ocr_result = {"amount": None, "raw_text": ""}
+        print(f"[Image Download/OCR Error] {e}")
+        ocr_result = {"amount": None, "raw_text": str(e), "debug_lines": []}
 
     amount = ocr_result.get("amount")
 
@@ -194,17 +194,22 @@ def handle_image(event: MessageEvent):
     db.delete_pending(user_id)
 
     if amount and amount > 0:
-        # Amount read → save pending, ask for description
         db.add_pending(user_id, amount, "", "", ocr_result.get("raw_text", ""))
         db.update_pending_state(user_id, "awaiting_description")
         _reply(token, [TextMessage(
-            text=f"📸 Slip read!\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. iced coffee, taxi, lunch)"
+            text=f"📸 Slip read!\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. coffee, taxi, lunch)"
         )])
     else:
-        # Could not read → ask for manual amount
+        # Show first 10 lines of what Tesseract actually read so we can debug
+        debug_lines = ocr_result.get("debug_lines", [])
+        preview = "\n".join(ln for ln in debug_lines[:12] if ln.strip()) or "(nothing read)"
         db.add_pending(user_id, 0, "", "", "")
         _reply(token, [TextMessage(
-            text="📸 Got the slip! Couldn't read the amount clearly.\n\nPlease type:\nedit [amount]\n\nExample: edit 140"
+            text=(
+                "📸 Got the slip — couldn't detect the amount.\n\n"
+                f"🔍 OCR read:\n{preview}\n\n"
+                "Please type the amount manually:\nedit [amount]\nExample: edit 200"
+            )
         )])
 
 
