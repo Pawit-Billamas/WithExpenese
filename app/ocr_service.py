@@ -45,17 +45,22 @@ def _preprocess(image_bytes: bytes) -> "Image.Image":
 # ── Amount extraction ─────────────────────────────────────────────────
 
 def _find_fee_amounts(lines: list[str]) -> set[str]:
-    """Collect all numbers that appear on or immediately after a fee label line."""
+    """
+    Collect numbers that appear on / immediately after a fee label line.
+    Only match decimal-formatted amounts (e.g. 0.00) to avoid false positives
+    from reference numbers like 6181151438001000015B9790.
+    """
     fee_amounts: set[str] = set()
     fee_keywords = ("ค่าธรรมเนียม", "ธรรมเนียม", "fee", "charge")
     for i, line in enumerate(lines):
         low = line.lower()
         if any(k in low for k in fee_keywords):
-            # Check current line + next line for numbers
             check = line + " " + (lines[i + 1] if i + 1 < len(lines) else "")
-            for m in re.finditer(r"[\d,]+\.?\d*", check):
+            # Only grab numbers that have a decimal point (real amounts like 0.00)
+            for m in re.finditer(r"\d[\d,]*\.\d{1,2}", check):
                 fee_amounts.add(m.group().replace(",", ""))
     return fee_amounts
+
 
 
 def _parse_number(raw: str) -> float | None:
