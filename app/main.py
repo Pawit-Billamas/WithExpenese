@@ -1,7 +1,10 @@
+import csv
+import io
 import os
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from app import database as db
 from app.database import init_db
 from app.line_handlers import handle_webhook
 
@@ -51,6 +54,31 @@ async def ocr_status():
     """Diagnostic: check if Tesseract is installed and working."""
     from app.ocr_service import get_status
     return JSONResponse(get_status())
+
+
+@app.get("/export/{user_id}.csv")
+async def export_csv(user_id: str):
+    """Download all of a user's transactions as a CSV file."""
+    txns = db.get_all_transactions(user_id)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["date", "description", "category", "amount", "source"])
+    for t in txns:
+        writer.writerow([
+            str(t["created_at"])[:10],
+            t["description"] or "",
+            t["category"],
+            t["amount"],
+            t["source"],
+        ])
+    buf.seek(0)
+
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="expenses_{user_id}.csv"'},
+    )
 
 
 @app.get("/setup-rich-menu")

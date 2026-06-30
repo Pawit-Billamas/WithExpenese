@@ -72,27 +72,33 @@ def _preprocess_variants(image_bytes: bytes):
     Return preprocessed PIL images to try, from gentle to aggressive.
     Different slips respond better to different thresholds, so we try several
     and use the first that yields a valid amount.
+
+    Ordered cheapest/most-likely-to-succeed first so the common case (a clean
+    slip photo) exits after the first attempt instead of running the full
+    matrix. Upscaling is only applied to genuinely small images — modern
+    phone photos are already well above the OCR-useful resolution, so
+    doubling them just adds CPU time for no accuracy gain.
     """
     base = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     w, h = base.size
-    scale = 2 if max(w, h) < 2000 else 1
-    if scale != 1:
-        base = base.resize((w * scale, h * scale), Image.LANCZOS)
+    if max(w, h) < 1000:
+        base = base.resize((w * 2, h * 2), Image.LANCZOS)
 
     gray = base.convert("L")
     variants = []
 
-    # Variant A: gentle — keeps thin Thai glyphs
-    a = ImageEnhance.Contrast(gray).enhance(1.8).filter(ImageFilter.SHARPEN)
-    variants.append(a)
-
-    # Variant B: medium threshold (clean slips)
+    # Variant B first: medium threshold — handles the common "clean slip" case
+    # cheaply (one contrast pass + threshold, no sharpen).
     b = ImageEnhance.Contrast(gray).enhance(2.5)
     b = b.point(lambda p: 0 if p < 140 else 255)
     variants.append(b)
 
-    # Variant C: aggressive threshold (heavy watermarks)
+    # Variant A: gentle — keeps thin Thai glyphs (for slips variant B blows out)
+    a = ImageEnhance.Contrast(gray).enhance(1.8).filter(ImageFilter.SHARPEN)
+    variants.append(a)
+
+    # Variant C: aggressive threshold (heavy watermarks) — last resort
     c = ImageEnhance.Contrast(gray).enhance(3.5)
     c = ImageEnhance.Brightness(c).enhance(1.15)
     c = c.point(lambda p: 0 if p < 165 else 255).filter(ImageFilter.SHARPEN)
@@ -209,8 +215,13 @@ def _run_ocr(image_bytes: bytes) -> dict:
     if TESSERACT_AVAILABLE:
         try:
             variants = _preprocess_variants(image_bytes)
-            for img in variants:
-                for psm in (6, 4, 11):
+            # psm 6 (uniform block of text) alone resolves the large majority
+            # of slips. Only escalate to 4/11 — and only on later variants —
+            # when the cheap pass didn't find an amount, instead of always
+            # running all 3 PSM modes on every variant (9 passes -> as few as 1).
+            for i, img in enumerate(variants):
+                psms = (6,) if i == 0 else (6, 4, 11)
+                for psm in psms:
                     cfg = f"--psm {psm} --oem 3 -l {OCR_LANG}"
                     text = pytesseract.image_to_string(img, config=cfg)
                     last_text = text or last_text

@@ -123,7 +123,7 @@ def handle_text(event: MessageEvent):
             "📋 recent — last 5 transactions\n"
             "📊 summary — monthly breakdown\n"
             "📂 categories — list categories\n"
-            "📤 export — show all transactions\n"
+            "📤 export — download all transactions as CSV\n"
             "✏️ edit [amount] — fix amount on pending slip"
         ))])
         return
@@ -418,11 +418,7 @@ def _handle_export(user_id: str, token: str):
     if not txns:
         _reply(token, [TextMessage(text="📭 No transactions.")])
         return
-    lines = [f"📤 {len(txns)} transactions:\n"]
-    for t in txns[:20]:
-        date = str(t["created_at"])[:10]
-        name = t["description"] or "-"
-        lines.append(f"{date} | {name} | {t['amount']:,.0f} THB | {t['category']}")
-    if len(txns) > 20:
-        lines.append(f"... and {len(txns) - 20} more")
-    _reply(token, [TextMessage(text="\n".join(lines))])
+    url = f"{settings.BASE_URL}/export/{user_id}.csv"
+    _reply(token, [TextMessage(
+        text=f"📤 {len(txns)} transactions\n\nDownload as CSV:\n{url}"
+    )])
