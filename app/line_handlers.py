@@ -1,7 +1,6 @@
-import io
-import csv
 import re
 import urllib.request
+import asyncio
 from fastapi import Request
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -30,36 +29,50 @@ configuration = Configuration(access_token=settings.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(channel_secret=settings.LINE_CHANNEL_SECRET)
 
 
-def get_image_content(message_id: str) -> bytes:
-    """Download image bytes from LINE (synchronous, no extra deps)."""
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _get_image_bytes(message_id: str) -> bytes:
+    """Download image bytes from LINE servers."""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {settings.LINE_CHANNEL_ACCESS_TOKEN}"}
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read()
 
 
-def build_category_quick_reply(categories: list[str]) -> QuickReply:
-    items = []
-    for cat in categories[:10]:
-        items.append(QuickReplyItem(action=MessageAction(label=cat, text=cat)))
-    items.append(QuickReplyItem(action=MessageAction(label="➕ New Category", text="➕ New Category")))
+def _build_category_quick_reply(categories: list[str]) -> QuickReply:
+    items = [QuickReplyItem(action=MessageAction(label=c, text=c)) for c in categories[:10]]
+    items.append(QuickReplyItem(action=MessageAction(label="➕ New", text="➕ New Category")))
     return QuickReply(items=items)
 
 
-def build_budget_warning(user_id: str, current_amount: float) -> str:
+def _budget_warning(user_id: str, added: float) -> str:
     budget = settings.MONTHLY_BUDGET
     if budget <= 0:
         return ""
-    monthly_total = db.get_monthly_total(user_id) + current_amount
-    pct = (monthly_total / budget) * 100
+    total = db.get_monthly_total(user_id) + added
+    pct = (total / budget) * 100
     if pct >= 100:
-        return f"\n\n⚠️ **Budget Exceeded!** Month total: {monthly_total:,.0f} / {budget:,.0f} THB ({pct:.0f}%)"
-    elif pct >= 80:
-        return f"\n\n⚠️ **Budget Alert ({pct:.0f}%)** Month total: {monthly_total:,.0f} / {budget:,.0f} THB"
-    elif pct >= 50:
-        return f"\nℹ️ Month total: {monthly_total:,.0f} / {budget:,.0f} THB ({pct:.0f}%)"
+        return f"\n\n⚠️ Budget exceeded! {total:,.0f} / {budget:,.0f} THB ({pct:.0f}%)"
+    if pct >= 80:
+        return f"\n\n⚠️ Budget {pct:.0f}% used — {total:,.0f} / {budget:,.0f} THB"
+    if pct >= 50:
+        return f"\nℹ️ {total:,.0f} / {budget:,.0f} THB ({pct:.0f}%)"
     return ""
 
+
+def _reply(reply_token: str, messages: list):
+    try:
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(reply_token=reply_token, messages=messages)
+            )
+    except Exception as e:
+        print(f"[Reply Error] {e}")
+
+
+# ── Webhook entry point ───────────────────────────────────────────────
 
 async def handle_webhook(request: Request):
     body = await request.body()
@@ -71,245 +84,286 @@ async def handle_webhook(request: Request):
     return {"status": "ok"}
 
 
+# ── EVENT: Follow ─────────────────────────────────────────────────────
+
 @handler.add(FollowEvent)
 def handle_follow(event: FollowEvent):
-    welcome = (
-        "👋 Welcome to FREE Expense Tracker Bot!\n\n"
-        "📸 Send me a payment slip photo\n"
-        "💰 Type: cash [amount] [description]\n\n"
-        "Commands: recent, summary, categories, export"
-    )
-    _reply(event.reply_token, [TextMessage(text=welcome)])
+    _reply(event.reply_token, [TextMessage(text=(
+        "👋 Welcome to Expense Tracker!\n\n"
+        "📸 Send a slip photo → I'll read the amount\n"
+        "💰 Type: cash [amount] → I'll ask what it's for\n\n"
+        "📊 Commands: recent · summary · categories · export · help"
+    ))])
 
+
+# ── EVENT: Text message ───────────────────────────────────────────────
 
 @handler.add(MessageEvent, message=TextMessageContent)
-def handle_text_message(event: MessageEvent):
+def handle_text(event: MessageEvent):
     user_id = event.source.user_id
     text = event.message.text.strip()
-    reply_token = event.reply_token
+    token = event.reply_token
 
-    cash_match = re.match(r"^cash\s+(\d+(?:\.\d{1,2})?)\s*(.*)?$", text, re.IGNORECASE)
-    if cash_match:
-        _handle_cash_command(user_id, reply_token, cash_match)
-        return True
-
-    edit_match = re.match(r"^edit\s+(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
-    if edit_match:
-        _handle_edit_command(user_id, reply_token, edit_match)
-        return True
-
-    if text.lower() == "export":
-        _handle_export(user_id, reply_token)
-        return True
+    # ── Built-in commands ──────────────────────────────────────────
+    if text.lower() == "help":
+        _reply(token, [TextMessage(text=(
+            "📚 Commands\n\n"
+            "💰 cash [amount] — log cash expense\n"
+            "   Example: cash 150\n\n"
+            "📸 Send a slip photo — auto-reads amount\n\n"
+            "📋 recent — last 5 transactions\n"
+            "📊 summary — monthly breakdown\n"
+            "📂 categories — list categories\n"
+            "📤 export — show all transactions\n"
+            "✏️ edit [amount] — fix amount on pending slip"
+        ))])
+        return
 
     if text.lower() == "recent":
-        _handle_recent(user_id, reply_token)
-        return True
+        _handle_recent(user_id, token)
+        return
 
     if text.lower() == "summary":
-        _handle_summary(user_id, reply_token)
-        return True
+        _handle_summary(user_id, token)
+        return
 
     if text.lower() == "categories":
-        _handle_list_categories(user_id, reply_token)
-        return True
+        _handle_categories(user_id, token)
+        return
 
-    if text.lower() == "log cash":
-        _reply(reply_token, [TextMessage(text="To log cash: type `cash [amount] [description]`\nExample: cash 120 lunch")])
-        return True
+    if text.lower() == "export":
+        _handle_export(user_id, token)
+        return
 
-    if text.lower() == "help":
-        help_text = (
-            "📚 **Expense Tracker Commands**\n\n"
-            "💰 Log Expense:\n"
-            "• cash [amount] [description]\n"
-            "• Example: cash 120 lunch\n\n"
-            "📸 Send Slip Photo:\n"
-            "• Bot reads amount automatically\n\n"
-            "📊 View Data:\n"
-            "• recent - Last 5 transactions\n"
-            "• summary - Monthly breakdown\n"
-            "• export - Download all data\n"
-            "• categories - List categories\n\n"
-            "✏️ Edit Amount:\n"
-            "• edit [amount]\n"
-            "• Example: edit 150"
-        )
-        _reply(reply_token, [TextMessage(text=help_text)])
-        return True
+    # ── cash [amount] ──────────────────────────────────────────────
+    cash_match = re.match(r"^cash\s+(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
+    if cash_match:
+        _start_cash(user_id, token, float(cash_match.group(1)))
+        return
 
+    # ── edit [amount] (fix amount on a pending slip) ───────────────
+    edit_match = re.match(r"^edit\s+(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
+    if edit_match:
+        _handle_edit(user_id, token, float(edit_match.group(1)))
+        return
+
+    # ── Pending-state machine ──────────────────────────────────────
     pending = db.get_pending(user_id)
-    if pending and pending["state"] == "awaiting_new_category_name":
-        _finalize_new_category(user_id, reply_token, pending, text)
-        return True
+
+    if pending and pending["state"] == "awaiting_description":
+        _handle_description_input(user_id, token, pending, text)
+        return
 
     if pending and pending["state"] == "awaiting_category":
-        _handle_category_selection(user_id, reply_token, pending, text)
-        return True
+        _handle_category_selection(user_id, token, pending, text)
+        return
 
-    _reply(reply_token, [TextMessage(text="Commands:\n• cash [amount] [desc]\n• recent\n• summary\n• export\n• categories")])
-    return True
+    if pending and pending["state"] == "awaiting_new_category_name":
+        _finalize_new_category(user_id, token, pending, text)
+        return
 
+    _reply(token, [TextMessage(text="Type 'help' to see commands.")])
+
+
+# ── EVENT: Image (slip photo) ─────────────────────────────────────────
 
 @handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image_message(event: MessageEvent):
-    """Process slip image - manual amount entry (no OCR)."""
+def handle_image(event: MessageEvent):
+    """
+    Download slip, run OCR via Gemini Vision.
+    If amount found  → ask for item name.
+    If amount NOT found → ask user to type it with 'edit [amount]'.
+    """
     user_id = event.source.user_id
-    reply_token = event.reply_token
-    db.add_pending(user_id, 0, "Slip photo", "", "Awaiting manual amount")
-    _reply(reply_token, [TextMessage(
-        text="📸 Image received!\n\nType amount:\nedit [amount]\n\nExample: edit 140"
+    token = event.reply_token
+    message_id = event.message.id
+
+    try:
+        image_bytes = _get_image_bytes(message_id)
+        # Run async OCR in sync context
+        ocr_result = asyncio.get_event_loop().run_until_complete(
+            ocr_slip_image(image_bytes)
+        )
+    except Exception as e:
+        print(f"[Image Download Error] {e}")
+        ocr_result = {"amount": None, "raw_text": ""}
+
+    amount = ocr_result.get("amount")
+
+    # Clear any stale pending
+    db.delete_pending(user_id)
+
+    if amount and amount > 0:
+        # Amount read → save pending, ask for description
+        db.add_pending(user_id, amount, "", "", ocr_result.get("raw_text", ""))
+        db.update_pending_state(user_id, "awaiting_description")
+        _reply(token, [TextMessage(
+            text=f"📸 Slip read!\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. iced coffee, taxi, lunch)"
+        )])
+    else:
+        # Could not read → ask for manual amount
+        db.add_pending(user_id, 0, "", "", "")
+        _reply(token, [TextMessage(
+            text="📸 Got the slip! Couldn't read the amount clearly.\n\nPlease type:\nedit [amount]\n\nExample: edit 140"
+        )])
+
+
+# ── Flow steps ────────────────────────────────────────────────────────
+
+def _start_cash(user_id: str, token: str, amount: float):
+    """User typed 'cash 150' — clear any pending, save amount, ask for item name."""
+    db.delete_pending(user_id)
+    db.add_pending(user_id, amount, "", "", "")
+    db.update_pending_state(user_id, "awaiting_description")
+    _reply(token, [TextMessage(
+        text=f"💰 {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. iced coffee, taxi, lunch)"
     )])
 
 
-
-
-def _handle_cash_command(user_id: str, reply_token: str, match: re.Match):
-    amount = float(match.group(1))
-    desc = match.group(2) or ""
-    pending = db.get_pending(user_id)
-    if pending:
-        db.delete_pending(user_id)
-    db.add_pending(user_id, amount, desc, "")
-    cats = db.get_categories()
-    qr = build_category_quick_reply(cats)
-    _reply(reply_token, [TextMessage(text=f"💰 Cash: {amount:,.0f} THB. Select category:", quick_reply=qr)])
-
-
-def _handle_edit_command(user_id: str, reply_token: str, match: re.Match):
+def _handle_edit(user_id: str, token: str, new_amount: float):
+    """User typed 'edit 140' — update amount on pending slip, ask for item name."""
     pending = db.get_pending(user_id)
     if not pending:
-        _reply(reply_token, [TextMessage(text="❌ No pending transaction.")])
+        _reply(token, [TextMessage(text="❌ No pending transaction. Send a slip first.")])
         return
-    new_amount = float(match.group(1))
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE pending_transactions SET amount = %s WHERE id = %s", (new_amount, pending["id"]))
+    cursor.execute(
+        "UPDATE pending_transactions SET amount = %s WHERE id = %s",
+        (new_amount, pending["id"])
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+    db.update_pending_state(user_id, "awaiting_description")
+    _reply(token, [TextMessage(
+        text=f"✅ Amount set: {new_amount:,.0f} THB\n\nWhat's the item name?\n(e.g. iced coffee, taxi, lunch)"
+    )])
+
+
+def _handle_description_input(user_id: str, token: str, pending: dict, text: str):
+    """User typed an item name — save it, show category picker."""
+    description = text.strip()
+    if not description:
+        _reply(token, [TextMessage(text="Please type a name for this expense.")])
+        return
+    # Save description into the pending row
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE pending_transactions SET description = %s, state = 'awaiting_category' WHERE id = %s",
+        (description, pending["id"])
+    )
     conn.commit()
     cursor.close()
     conn.close()
     cats = db.get_categories()
-    qr = build_category_quick_reply(cats)
-    _reply(reply_token, [TextMessage(text=f"✅ Amount: {new_amount:,.0f} THB. Select category:", quick_reply=qr)])
+    qr = _build_category_quick_reply(cats)
+    _reply(token, [TextMessage(
+        text=f"📝 \"{description}\" — {pending['amount']:,.0f} THB\n\nPick a category:",
+        quick_reply=qr
+    )])
 
 
-def _handle_export(user_id: str, reply_token: str):
-    transactions = db.get_all_transactions(user_id)
-    if not transactions:
-        _reply(reply_token, [TextMessage(text="📭 No transactions.")])
-        return
-    lines = [f"📊 {len(transactions)} transactions:\n"]
-    for t in transactions[:20]:
-        lines.append(f"{t['amount']:,.0f} THB — {t['category']} — {t['created_at'][:10]}")
-    _reply(reply_token, [TextMessage(text="\n".join(lines))])
-
-
-def _handle_recent(user_id: str, reply_token: str):
-    transactions = db.get_all_transactions(user_id)
-    if not transactions:
-        _reply(reply_token, [TextMessage(text="📭 No transactions.")])
-        return
-    lines = ["📋 Recent:"]
-    for t in transactions[:5]:
-        lines.append(f"• {t['amount']:,.0f} THB — {t['category']}")
-    _reply(reply_token, [TextMessage(text="\n".join(lines))])
-
-
-def _handle_summary(user_id: str, reply_token: str):
-    monthly = db.get_monthly_total(user_id)
-    rows = db.get_monthly_summary(user_id)
-    if not rows:
-        _reply(reply_token, [TextMessage(text="📭 No transactions.")])
-        return
-    lines = [f"📊 Total: {monthly:,.0f} THB\n"]
-    for r in rows:
-        lines.append(f"• {r['category']}: {r['total']:,.0f}")
-    budget = settings.MONTHLY_BUDGET
-    if budget > 0:
-        pct = (monthly / budget) * 100
-        lines.append(f"\nBudget: {pct:.0f}%")
-    _reply(reply_token, [TextMessage(text="\n".join(lines))])
-
-
-def _handle_list_categories(user_id: str, reply_token: str):
-    cats = db.get_categories()
-    if not cats:
-        _reply(reply_token, [TextMessage(text="📭 No categories.")])
-        return
-    lines = ["📂 Categories:"]
-    for i, c in enumerate(cats, 1):
-        lines.append(f"{i}. {c}")
-    _reply(reply_token, [TextMessage(text="\n".join(lines))])
-
-
-def _finalize_new_category(user_id: str, reply_token: str, pending: dict, text: str):
-    new_cat = text.strip()
-    if not new_cat:
-        _reply(reply_token, [TextMessage(text="Enter a valid name.")])
-        return
-    if db.add_category(new_cat):
-        db.add_transaction(
-            user_id=user_id, amount=pending["amount"], category=new_cat,
-            description=pending["description"], image_url=pending["image_url"],
-            source="slip" if pending["image_url"] else "cash"
-        )
-        db.delete_pending(user_id)
-        warning = build_budget_warning(user_id, pending["amount"])
-        _reply(reply_token, [TextMessage(text=f"✅ Added '{new_cat}' → {pending['amount']:,.0f} THB{warning}")])
-    else:
-        _reply(reply_token, [TextMessage(text=f"❌ '{new_cat}' exists.")])
-
-
-def _handle_category_selection(user_id: str, reply_token: str, pending: dict, text: str):
+def _handle_category_selection(user_id: str, token: str, pending: dict, text: str):
+    """User picked a category (or tapped ➕ New)."""
     cats = db.get_categories()
     if text in cats:
         db.add_transaction(
-            user_id=user_id, amount=pending["amount"], category=text,
-            description=pending["description"], image_url=pending["image_url"],
-            source="slip" if pending["image_url"] else "cash"
+            user_id=user_id,
+            amount=pending["amount"],
+            category=text,
+            description=pending["description"],
+            image_url=pending.get("image_url", ""),
+            source="slip" if pending.get("image_url") else "cash",
         )
         db.delete_pending(user_id)
-        warning = build_budget_warning(user_id, pending["amount"])
-        _reply(reply_token, [TextMessage(text=f"✅ {pending['amount']:,.0f} THB → {text}{warning}")])
+        warning = _budget_warning(user_id, pending["amount"])
+        _reply(token, [TextMessage(
+            text=f"✅ Saved!\n📝 {pending['description']}\n💰 {pending['amount']:,.0f} THB → {text}{warning}"
+        )])
     elif text == "➕ New Category":
         db.update_pending_state(user_id, "awaiting_new_category_name")
-        _reply(reply_token, [TextMessage(text="Type new category:")])
+        _reply(token, [TextMessage(text="Type the new category name:")])
     else:
-        _reply(reply_token, [TextMessage(text="❌ Choose from list.")])
+        cats = db.get_categories()
+        qr = _build_category_quick_reply(cats)
+        _reply(token, [TextMessage(text="Please pick a category from the list:", quick_reply=qr)])
 
 
-async def _process_image(user_id: str, message_id: str, reply_token: str):
-    try:
-        image_bytes = await get_image_content(message_id)
-        _reply(reply_token, [TextMessage(text="📸 Processing slip... ⏳")])
-        
-        # OCR the image
-        ocr_result = await ocr_slip_image(image_bytes)
-        amount = ocr_result.get("amount")
-        
-        if amount and amount > 0:
-            # Amount found! Show categories immediately
-            db.add_pending(user_id, amount, "Payment slip", "", ocr_result.get("raw_text", ""))
-            cats = db.get_categories()
-            qr = build_category_quick_reply(cats)
-            _reply(reply_token, [TextMessage(
-                text=f"✅ Found amount: {amount:,.0f} THB\n\nSelect category:",
-                quick_reply=qr
-            )])
-        else:
-            # Couldn't read amount, ask user to enter manually
-            db.add_pending(user_id, 0, "Payment slip", "", ocr_result.get("raw_text", ""))
-            _reply(reply_token, [TextMessage(
-                text=f"🤔 Couldn't read amount clearly.\n\nType: edit [amount]\nExample: edit 140"
-            )])
-    except Exception as e:
-        _reply(reply_token, [TextMessage(text=f"❌ Error: {e}")])
+def _finalize_new_category(user_id: str, token: str, pending: dict, text: str):
+    """User typed a new category name."""
+    new_cat = text.strip()
+    if not new_cat:
+        _reply(token, [TextMessage(text="Please enter a valid category name.")])
+        return
+    if db.add_category(new_cat):
+        db.add_transaction(
+            user_id=user_id,
+            amount=pending["amount"],
+            category=new_cat,
+            description=pending["description"],
+            image_url=pending.get("image_url", ""),
+            source="slip" if pending.get("image_url") else "cash",
+        )
+        db.delete_pending(user_id)
+        warning = _budget_warning(user_id, pending["amount"])
+        _reply(token, [TextMessage(
+            text=f"✅ Saved!\n📝 {pending['description']}\n💰 {pending['amount']:,.0f} THB → {new_cat}{warning}"
+        )])
+    else:
+        _reply(token, [TextMessage(text=f"❌ '{new_cat}' already exists. Pick from the list.")])
 
 
-def _reply(reply_token: str, messages: list):
-    try:
-        with ApiClient(configuration) as api_client:
-            api_instance = MessagingApi(api_client)
-            api_instance.reply_message(ReplyMessageRequest(reply_token=reply_token, messages=messages))
-    except Exception as e:
-        print(f"[Reply Error] {e}")
+# ── View commands ─────────────────────────────────────────────────────
+
+def _handle_recent(user_id: str, token: str):
+    txns = db.get_all_transactions(user_id)
+    if not txns:
+        _reply(token, [TextMessage(text="📭 No transactions yet.")])
+        return
+    lines = ["📋 Recent 5 transactions:"]
+    for t in txns[:5]:
+        date = str(t["created_at"])[:10]
+        lines.append(f"• {t['description'] or t['category']} — {t['amount']:,.0f} THB [{t['category']}] {date}")
+    _reply(token, [TextMessage(text="\n".join(lines))])
+
+
+def _handle_summary(user_id: str, token: str):
+    monthly = db.get_monthly_total(user_id)
+    rows = db.get_monthly_summary(user_id)
+    if not rows:
+        _reply(token, [TextMessage(text="📭 No transactions this month.")])
+        return
+    lines = [f"📊 This month: {monthly:,.0f} THB\n"]
+    for r in rows:
+        lines.append(f"• {r['category']}: {r['total']:,.0f} THB ({r['count']} items)")
+    budget = settings.MONTHLY_BUDGET
+    if budget > 0:
+        pct = (monthly / budget) * 100
+        lines.append(f"\n📈 Budget: {pct:.0f}% used ({monthly:,.0f} / {budget:,.0f} THB)")
+    _reply(token, [TextMessage(text="\n".join(lines))])
+
+
+def _handle_categories(user_id: str, token: str):
+    cats = db.get_categories()
+    if not cats:
+        _reply(token, [TextMessage(text="📭 No categories yet.")])
+        return
+    lines = ["📂 Categories:"] + [f"{i}. {c}" for i, c in enumerate(cats, 1)]
+    _reply(token, [TextMessage(text="\n".join(lines))])
+
+
+def _handle_export(user_id: str, token: str):
+    txns = db.get_all_transactions(user_id)
+    if not txns:
+        _reply(token, [TextMessage(text="📭 No transactions.")])
+        return
+    lines = [f"📤 {len(txns)} transactions:\n"]
+    for t in txns[:20]:
+        date = str(t["created_at"])[:10]
+        name = t["description"] or "-"
+        lines.append(f"{date} | {name} | {t['amount']:,.0f} THB | {t['category']}")
+    if len(txns) > 20:
+        lines.append(f"... and {len(txns) - 20} more")
+    _reply(token, [TextMessage(text="\n".join(lines))])
