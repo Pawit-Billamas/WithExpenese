@@ -215,11 +215,19 @@ def _run_ocr(image_bytes: bytes) -> dict:
 
 # ── Public API ────────────────────────────────────────────────────────
 
-async def ocr_slip_image(image_bytes: bytes) -> dict:
+def ocr_slip_image_sync(image_bytes: bytes) -> dict:
     """
-    Run Tesseract OCR on a slip image (free, no tokens).
+    Synchronous OCR on a slip image (free, no tokens).
+    Tesseract is blocking CPU work, so this is sync and safe to call from
+    inside the (already-running) FastAPI/uvicorn event loop without spinning
+    up a nested loop.
     Returns {"amount": float_or_none, "raw_text": str, "debug_lines": list}.
     """
+    return _run_ocr(image_bytes)
+
+
+async def ocr_slip_image(image_bytes: bytes) -> dict:
+    """Async wrapper kept for backward compatibility."""
     return _run_ocr(image_bytes)
 
 

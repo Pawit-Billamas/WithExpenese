@@ -1,6 +1,5 @@
 import re
 import urllib.request
-import asyncio
 from fastapi import Request
 from linebot.v3 import WebhookHandler
 from linebot.v3.messaging import (
@@ -23,7 +22,7 @@ from linebot.exceptions import InvalidSignatureError
 
 from app.config import settings
 from app import database as db
-from app.ocr_service import ocr_slip_image
+from app.ocr_service import ocr_slip_image_sync
 
 configuration = Configuration(access_token=settings.LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(channel_secret=settings.LINE_CHANNEL_SECRET)
@@ -180,10 +179,11 @@ def handle_image(event: MessageEvent):
 
     try:
         image_bytes = _get_image_bytes(message_id)
-        # Run async OCR in sync context
-        loop = asyncio.new_event_loop()
-        ocr_result = loop.run_until_complete(ocr_slip_image(image_bytes))
-        loop.close()
+        # Tesseract is blocking CPU work — call it synchronously.
+        # (Spinning up a nested event loop here crashes inside uvicorn's
+        #  already-running loop: "Cannot run the event loop while another
+        #  loop is running".)
+        ocr_result = ocr_slip_image_sync(image_bytes)
     except Exception as e:
         print(f"[Image Download/OCR Error] {e}")
         ocr_result = {"amount": None, "raw_text": str(e), "debug_lines": []}
