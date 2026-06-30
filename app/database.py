@@ -1,14 +1,39 @@
 import os
-import psycopg2
-import psycopg2.extras
-import psycopg2.errors
+import ssl
+import pg8000
+import pg8000.dbapi
+from urllib.parse import urlparse
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 
-def get_connection() -> psycopg2.extensions.connection:
-    """Return a psycopg2 connection."""
-    return psycopg2.connect(DATABASE_URL)
+def _parse_url() -> dict:
+    """Parse a postgres:// URL into pg8000 connect kwargs."""
+    p = urlparse(DATABASE_URL)
+    return {
+        "host": p.hostname,
+        "port": p.port or 5432,
+        "database": p.path.lstrip("/"),
+        "user": p.username,
+        "password": p.password,
+    }
+
+
+def get_connection():
+    """Return a pg8000 connection (SSL required for Neon)."""
+    ssl_ctx = ssl.create_default_context()
+    return pg8000.connect(**_parse_url(), ssl_context=ssl_ctx)
+
+
+def _as_dict(cursor, row) -> dict:
+    """Convert a single row tuple to a dict using cursor.description."""
+    cols = [d[0] for d in cursor.description]
+    return dict(zip(cols, row))
+
+
+def _all_as_dicts(cursor) -> list[dict]:
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 
 def init_db():
@@ -18,9 +43,9 @@ def init_db():
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id          SERIAL PRIMARY KEY,
-            name        TEXT NOT NULL UNIQUE,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            id         SERIAL PRIMARY KEY,
+            name       TEXT NOT NULL UNIQUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
 
@@ -50,12 +75,10 @@ def init_db():
         )
     """)
 
-    # Seed default categories if table is empty
+    # Seed default categories if empty
     cursor.execute("SELECT COUNT(*) FROM categories")
-    existing = cursor.fetchone()[0]
-    if existing == 0:
-        default_cats = ["Food", "Transport", "Bills", "Shopping", "Entertainment", "Health"]
-        for cat in default_cats:
+    if cursor.fetchone()[0] == 0:
+        for cat in ["Food", "Transport", "Bills", "Shopping", "Entertainment", "Health"]:
             cursor.execute(
                 "INSERT INTO categories (name) VALUES (%s) ON CONFLICT DO NOTHING", (cat,)
             )
@@ -65,15 +88,17 @@ def init_db():
     conn.close()
 
 
-# ── Pending transaction helpers ──────────────────────────────────────
+# ── Pending helpers ───────────────────────────────────────────────────
 
-def add_pending(user_id: str, amount: float, description: str, image_url: str,
-                raw_ocr: str = "") -> int:
+def add_pending(user_id: str, amount: float, description: str,
+                image_url: str, raw_ocr: str = "") -> int:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """INSERT INTO pending_transactions (user_id, amount, description, image_url, state, raw_ocr)
-           VALUES (%s, %s, %s, %s, 'awaiting_category', %s) RETURNING id""",
+        """INSERT INTO pending_transactions
+               (user_id, amount, description, image_url, state, raw_ocr)
+           VALUES (%s, %s, %s, %s, 'awaiting_category', %s)
+           RETURNING id""",
         (user_id, amount, description, image_url, raw_ocr),
     )
     pending_id = cursor.fetchone()[0]
@@ -85,15 +110,16 @@ def add_pending(user_id: str, amount: float, description: str, image_url: str,
 
 def get_pending(user_id: str):
     conn = get_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor = conn.cursor()
     cursor.execute(
         "SELECT * FROM pending_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     )
     row = cursor.fetchone()
+    result = _as_dict(cursor, row) if row else None
     cursor.close()
     conn.close()
-    return dict(row) if row else None
+    return result
 
 
 def update_pending_state(user_id: str, state: str) -> bool:
@@ -109,8 +135,7 @@ def update_pending_state(user_id: str, state: str) -> bool:
         conn.close()
         return False
     cursor.execute(
-        "UPDATE pending_transactions SET state = %s WHERE id = %s",
-        (state, row[0]),
+        "UPDATE pending_transactions SET state = %s WHERE id = %s", (state, row[0])
     )
     conn.commit()
     updated = cursor.rowcount > 0
@@ -139,16 +164,16 @@ def delete_pending(user_id: str) -> bool:
     return deleted
 
 
-# ── Category helpers ─────────────────────────────────────────────────
+# ── Category helpers ──────────────────────────────────────────────────
 
 def get_categories() -> list[str]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM categories ORDER BY name")
-    rows = cursor.fetchall()
+    rows = [r[0] for r in cursor.fetchall()]
     cursor.close()
     conn.close()
-    return [row[0] for row in rows]
+    return rows
 
 
 def add_category(name: str) -> bool:
@@ -158,15 +183,19 @@ def add_category(name: str) -> bool:
         cursor.execute("INSERT INTO categories (name) VALUES (%s)", (name.strip(),))
         conn.commit()
         return True
-    except psycopg2.errors.UniqueViolation:
+    except pg8000.dbapi.DatabaseError as e:
         conn.rollback()
-        return False
+        # pgcode 23505 = unique_violation
+        args = e.args[0] if e.args else {}
+        if isinstance(args, dict) and args.get("C") == "23505":
+            return False
+        raise
     finally:
         cursor.close()
         conn.close()
 
 
-# ── Transaction helpers ──────────────────────────────────────────────
+# ── Transaction helpers ───────────────────────────────────────────────
 
 def add_transaction(user_id: str, amount: float, category: str,
                     description: str = "", image_url: str = "",
@@ -174,8 +203,10 @@ def add_transaction(user_id: str, amount: float, category: str,
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        """INSERT INTO transactions (user_id, amount, category, description, image_url, source)
-           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+        """INSERT INTO transactions
+               (user_id, amount, category, description, image_url, source)
+           VALUES (%s, %s, %s, %s, %s, %s)
+           RETURNING id""",
         (user_id, amount, category, description, image_url, source),
     )
     trans_id = cursor.fetchone()[0]
@@ -186,7 +217,6 @@ def add_transaction(user_id: str, amount: float, category: str,
 
 
 def get_monthly_total(user_id: str) -> float:
-    """Sum of current month's transactions for the user."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -196,30 +226,28 @@ def get_monthly_total(user_id: str) -> float:
                = TO_CHAR(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM')""",
         (user_id,),
     )
-    total = cursor.fetchone()[0]
+    total = float(cursor.fetchone()[0])
     cursor.close()
     conn.close()
-    return float(total)
+    return total
 
 
 def get_all_transactions(user_id: str) -> list[dict]:
-    """Return all transactions for the user, newest first."""
     conn = get_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor = conn.cursor()
     cursor.execute(
         "SELECT * FROM transactions WHERE user_id = %s ORDER BY created_at DESC",
         (user_id,),
     )
-    rows = cursor.fetchall()
+    result = _all_as_dicts(cursor)
     cursor.close()
     conn.close()
-    return [dict(r) for r in rows]
+    return result
 
 
 def get_monthly_summary(user_id: str) -> list[dict]:
-    """Return per-category totals for the current month."""
     conn = get_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor = conn.cursor()
     cursor.execute(
         """SELECT category, SUM(amount) AS total, COUNT(*) AS count
            FROM transactions
@@ -230,7 +258,7 @@ def get_monthly_summary(user_id: str) -> list[dict]:
            ORDER BY total DESC""",
         (user_id,),
     )
-    rows = cursor.fetchall()
+    result = _all_as_dicts(cursor)
     cursor.close()
     conn.close()
-    return [dict(r) for r in rows]
+    return result
