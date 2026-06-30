@@ -41,9 +41,19 @@ def _get_image_bytes(message_id: str) -> bytes:
 
 
 def _build_category_quick_reply(categories: list[str]) -> QuickReply:
-    items = [QuickReplyItem(action=MessageAction(label=c, text=c)) for c in categories[:10]]
+    items = [QuickReplyItem(action=MessageAction(label=c, text=c)) for c in categories[:8]]
     items.append(QuickReplyItem(action=MessageAction(label="➕ New", text="➕ New Category")))
+    items.append(QuickReplyItem(action=MessageAction(label="✏️ Edit amount", text="edit")))
+    items.append(QuickReplyItem(action=MessageAction(label="❌ Cancel", text="cancel")))
     return QuickReply(items=items)
+
+
+def _action_quick_reply() -> QuickReply:
+    """Edit / Cancel buttons shown right after a slip is read."""
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="✏️ Edit amount", text="edit")),
+        QuickReplyItem(action=MessageAction(label="❌ Cancel", text="cancel")),
+    ])
 
 
 def _budget_warning(user_id: str, added: float) -> str:
@@ -134,6 +144,15 @@ def handle_text(event: MessageEvent):
         _handle_export(user_id, token)
         return
 
+    # ── cancel (discard the pending slip/transaction) ──────────────
+    if text.lower() == "cancel":
+        if db.get_pending(user_id):
+            db.delete_pending(user_id)
+            _reply(token, [TextMessage(text="❌ Cancelled. Nothing was saved.\nSend another slip or type 'cash 100'.")])
+        else:
+            _reply(token, [TextMessage(text="Nothing to cancel.")])
+        return
+
     # ── cash [amount] ──────────────────────────────────────────────
     cash_match = re.match(r"^cash\s+(\d+(?:\.\d{1,2})?)$", text, re.IGNORECASE)
     if cash_match:
@@ -146,8 +165,25 @@ def handle_text(event: MessageEvent):
         _handle_edit(user_id, token, float(edit_match.group(1)))
         return
 
+    # ── bare "edit" (button) → ask for the new amount ──────────────
+    if text.lower() == "edit":
+        if db.get_pending(user_id):
+            db.update_pending_state(user_id, "awaiting_amount")
+            _reply(token, [TextMessage(text="✏️ Type the correct amount (e.g. 100 or 100.50):")])
+        else:
+            _reply(token, [TextMessage(text="No pending slip. Send a slip first.")])
+        return
+
     # ── Pending-state machine ──────────────────────────────────────
     pending = db.get_pending(user_id)
+
+    if pending and pending["state"] == "awaiting_amount":
+        m = re.match(r"^(\d+(?:\.\d{1,2})?)$", text)
+        if m:
+            _handle_edit(user_id, token, float(m.group(1)))
+        else:
+            _reply(token, [TextMessage(text="Please type a number, e.g. 100 or 100.50 (or 'cancel').")])
+        return
 
     if pending and pending["state"] == "awaiting_description":
         _handle_description_input(user_id, token, pending, text)
@@ -198,7 +234,12 @@ def handle_image(event: MessageEvent):
         db.update_pending_state(user_id, "awaiting_description")
         via = " (via QR)" if ocr_result.get("source") == "qr" else ""
         _reply(token, [TextMessage(
-            text=f"📸 Slip read!{via}\n💰 Amount: {amount:,.0f} THB\n\nWhat's the item name?\n(e.g. coffee, taxi, lunch)"
+            text=(
+                f"📸 Slip read!{via}\n💰 Amount: {amount:,.0f} THB\n\n"
+                "If correct, type the item name (e.g. coffee, taxi, lunch).\n"
+                "Or tap a button below."
+            ),
+            quick_reply=_action_quick_reply()
         )])
     else:
         # Show first 10 lines of what Tesseract actually read so we can debug
