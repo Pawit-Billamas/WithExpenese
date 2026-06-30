@@ -3,7 +3,7 @@ services:
     name: linebot-expense-tracker
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: apt-get install -y tesseract-ocr tesseract-ocr-tha tesseract-ocr-eng && pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: LINE_CHANNEL_SECRET
@@ -13,6 +13,4 @@ services:
       - key: MONTHLY_BUDGET
         value: "20000"
       - key: DATABASE_URL
-        sync: false
-      - key: GEMINI_API_KEY
         sync: false
