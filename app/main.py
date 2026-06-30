@@ -36,12 +36,19 @@ async def webhook(request: Request):
     return await handle_webhook(request)
 
 
+@app.get("/ocr-status")
+async def ocr_status():
+    """Diagnostic: check if Tesseract is installed and working."""
+    from app.ocr_service import get_status
+    return JSONResponse(get_status())
+
+
 @app.get("/setup-rich-menu")
 async def setup_rich_menu_endpoint():
     """
     One-time setup: creates the 6-button rich menu in LINE and sets it as default.
     Visit this URL in your browser after deploying:
-      https://your-app.onrender.com/setup-rich-menu
+      https://withexpenese.onrender.com/setup-rich-menu
     """
     from app.rich_menu import setup_rich_menu
     image_path = _RICH_MENU_IMAGE if os.path.exists(_RICH_MENU_IMAGE) else None

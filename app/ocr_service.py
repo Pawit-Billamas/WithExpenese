@@ -1,133 +1,83 @@
 """
-OCR using Tesseract — optimised for Thai bank transfer slips (MyMo, KBank, etc.)
-No API keys or AI needed.
+OCR using Tesseract with English only — no Thai language pack required.
+Numbers like 200.00 and 100.00 are ASCII digits, readable by any Tesseract install.
+Strategy: find the largest decimal number (X.XX) that is > 0 and ≤ 99999.
+The fee is always 0.00 which is automatically excluded (value = 0).
 """
 import re
 import io
+import shutil
 
 try:
-    from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+    from PIL import Image, ImageEnhance, ImageFilter
     import pytesseract
+
+    # Find tesseract binary — Render installs it at /usr/bin/tesseract
+    _tess = shutil.which("tesseract") or "/usr/bin/tesseract"
+    pytesseract.pytesseract.tesseract_cmd = _tess
+
+    # Quick self-test at startup
+    _version = pytesseract.get_tesseract_version()
     TESSERACT_AVAILABLE = True
-except ImportError:
+    print(f"[OCR] Tesseract {_version} ready at: {_tess}")
+
+except Exception as _e:
     TESSERACT_AVAILABLE = False
+    _SETUP_ERROR = str(_e)
+    print(f"[OCR] Tesseract NOT available: {_e}")
 
 
 # ── Image preprocessing ───────────────────────────────────────────────
 
-def _preprocess(image_bytes: bytes) -> "Image.Image":
+def _preprocess(image_bytes: bytes):
     """
-    Scale up 2× then binarise to kill watermarks (mymo pattern, KBank building).
-    High contrast + threshold → clean black text on white.
+    Scale 2× + aggressive binarise to kill watermarks
+    (MyMo repeated 'mymo' pattern, KBank building).
     """
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    # Scale up 2× — Tesseract reads larger text much more reliably
+    # 2× upscale — Tesseract accuracy improves significantly
     w, h = img.size
     img = img.resize((w * 2, h * 2), Image.LANCZOS)
 
-    # Grayscale
+    # Grayscale → heavy contrast boost → hard threshold
     img = img.convert("L")
-
-    # Aggressive contrast boost to kill light watermarks
     img = ImageEnhance.Contrast(img).enhance(3.5)
     img = ImageEnhance.Brightness(img).enhance(1.2)
-
-    # Hard binarise: anything below 160 → black, else white
     img = img.point(lambda p: 0 if p < 160 else 255)
-
-    # One pass of sharpening
     img = img.filter(ImageFilter.SHARPEN)
 
     return img
 
 
-# ── Amount extraction ─────────────────────────────────────────────────
+# ── Amount extraction (no Thai needed) ───────────────────────────────
 
-def _find_fee_amounts(lines: list[str]) -> set[str]:
-    """
-    Collect numbers that appear on / immediately after a fee label line.
-    Only match decimal-formatted amounts (e.g. 0.00) to avoid false positives
-    from reference numbers like 6181151438001000015B9790.
-    """
-    fee_amounts: set[str] = set()
-    fee_keywords = ("ค่าธรรมเนียม", "ธรรมเนียม", "fee", "charge")
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if any(k in low for k in fee_keywords):
-            check = line + " " + (lines[i + 1] if i + 1 < len(lines) else "")
-            # Only grab numbers that have a decimal point (real amounts like 0.00)
-            for m in re.finditer(r"\d[\d,]*\.\d{1,2}", check):
-                fee_amounts.add(m.group().replace(",", ""))
-    return fee_amounts
-
-
-
-def _parse_number(raw: str) -> float | None:
-    try:
-        val = float(raw.replace(",", "").strip())
-        return val if 1.0 <= val <= 999999.0 else None
-    except ValueError:
-        return None
+# Matches amounts like 200.00 / 1,500.00 — exactly 1 or 2 decimal places
+_DECIMAL = re.compile(r"\b(\d{1,6}(?:,\d{3})*\.\d{2})\b")
 
 
 def _extract_amount(text: str) -> float | None:
     """
-    Priority order:
-    1. Number on the line immediately after จำนวนเงิน / จำนวน  (MyMo & KBank style)
-    2. Number on the same line as จำนวน followed by บาท
-    3. Any number + บาท that isn't a fee
-    4. Fallback: largest non-zero, non-fee number in range 1–99999
+    Find the transfer amount from raw OCR text.
+
+    Key observations (both MyMo & KBank slips):
+    - The actual transfer amount is a non-zero decimal: 200.00, 100.00
+    - The fee is always 0.00  → excluded because float("0.00") == 0.0 < 1.0
+    - Reference/account numbers have no decimal point → excluded by _DECIMAL pattern
+    - Dates/times use colons (15:04) or are integers → not matched by _DECIMAL
+
+    So: take the LARGEST decimal number ≥ 1.0 and ≤ 99999 → that is the amount.
     """
-    lines = [ln.strip() for ln in text.splitlines()]
-    fee_amounts = _find_fee_amounts(lines)
-
-    amount_keywords = re.compile(
-        r"^จำนวน(?:เงิน)?\s*[:\s]*$|^จำนวน(?:เงิน)?\s*[:\s]*(\d[\d,\.]*)",
-        re.IGNORECASE,
-    )
-
-    # ── Pass 1: keyword on its own line → grab number from next line ──
-    for i, line in enumerate(lines):
-        # Keyword alone on a line (e.g. "จำนวนเงิน" or "จำนวน:")
-        if re.match(r"^จำนวน(?:เงิน)?\s*[:\s]*$", line, re.IGNORECASE):
-            for j in range(i + 1, min(i + 3, len(lines))):
-                # Grab first number in the following line(s)
-                m = re.search(r"([\d,]+\.?\d*)", lines[j])
-                if m:
-                    raw = m.group(1).replace(",", "")
-                    if raw not in fee_amounts:
-                        val = _parse_number(raw)
-                        if val and val > 0:
-                            return val
-
-    # ── Pass 2: keyword + number on same line (e.g. "จำนวน: 100.00 บาท") ──
-    inline = re.compile(
-        r"จำนวน(?:เงิน)?\s*[:\s]+([\d,]+\.?\d*)", re.IGNORECASE
-    )
-    for m in inline.finditer(text):
-        raw = m.group(1).replace(",", "")
-        if raw not in fee_amounts:
-            val = _parse_number(raw)
-            if val and val > 0:
-                return val
-
-    # ── Pass 3: any "NUMBER บาท" that isn't a fee ────────────────────
-    for m in re.finditer(r"([\d,]+\.?\d*)\s*บาท", text):
-        raw = m.group(1).replace(",", "")
-        if raw not in fee_amounts:
-            val = _parse_number(raw)
-            if val and val > 0:
-                return val
-
-    # ── Pass 4: fallback — largest plausible non-fee number ──────────
     candidates = []
-    for m in re.finditer(r"\b(\d{2,6}(?:\.\d{1,2})?)\b", text):
-        raw = m.group(1)
-        if raw not in fee_amounts:
-            val = _parse_number(raw)
-            if val and val > 0:
+    for m in _DECIMAL.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            val = float(raw)
+            if 1.0 <= val <= 99999.0:
                 candidates.append(val)
+        except ValueError:
+            continue
+
     return max(candidates) if candidates else None
 
 
@@ -135,31 +85,51 @@ def _extract_amount(text: str) -> float | None:
 
 async def ocr_slip_image(image_bytes: bytes) -> dict:
     """
-    Run Tesseract on a slip image.
+    Run Tesseract (English only) on a slip image.
     Returns {"amount": float_or_none, "raw_text": str, "debug_lines": list}.
     """
-    if not TESSERACT_AVAILABLE or not image_bytes:
-        return {"amount": None, "raw_text": "", "debug_lines": []}
+    if not TESSERACT_AVAILABLE:
+        err = _SETUP_ERROR if "_SETUP_ERROR" in dir() else "Tesseract not installed"
+        return {"amount": None, "raw_text": f"[Setup error] {err}", "debug_lines": [f"[Setup error] {err}"]}
+
+    if not image_bytes:
+        return {"amount": None, "raw_text": "No image", "debug_lines": []}
 
     try:
         img = _preprocess(image_bytes)
+        raw_text = ""
 
-        # Try two PSM modes; use whichever finds the amount
-        for psm in (6, 4):
-            cfg = f"--psm {psm} --oem 3"
-            raw_text = pytesseract.image_to_string(img, lang="tha+eng", config=cfg)
-            print(f"[OCR PSM={psm}]\n{raw_text}\n{'─'*40}")
-            amount = _extract_amount(raw_text)
+        # Try two PSM modes — use whichever detects the amount
+        for psm in (6, 4, 11):
+            cfg = f"--psm {psm} --oem 3 -l eng"
+            text = pytesseract.image_to_string(img, config=cfg)
+            print(f"[OCR PSM={psm}]\n{text}\n{'─'*40}")
+            raw_text = text
+            amount = _extract_amount(text)
             if amount:
                 return {
                     "amount": amount,
-                    "raw_text": raw_text,
-                    "debug_lines": raw_text.splitlines(),
+                    "raw_text": text,
+                    "debug_lines": text.splitlines(),
                 }
 
-        # Neither PSM found an amount — return raw text so bot can show it
-        return {"amount": None, "raw_text": raw_text, "debug_lines": raw_text.splitlines()}
+        return {
+            "amount": None,
+            "raw_text": raw_text,
+            "debug_lines": raw_text.splitlines(),
+        }
 
     except Exception as e:
         print(f"[OCR Error] {e}")
-        return {"amount": None, "raw_text": str(e), "debug_lines": []}
+        return {"amount": None, "raw_text": f"[OCR Error] {e}", "debug_lines": [f"[OCR Error] {e}"]}
+
+
+def get_status() -> dict:
+    """Return Tesseract availability info — used by /ocr-status endpoint."""
+    if TESSERACT_AVAILABLE:
+        return {
+            "available": True,
+            "path": pytesseract.pytesseract.tesseract_cmd,
+            "version": str(pytesseract.get_tesseract_version()),
+        }
+    return {"available": False, "error": _SETUP_ERROR if "_SETUP_ERROR" in dir() else "unknown"}
