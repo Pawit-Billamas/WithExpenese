@@ -128,6 +128,15 @@ In **[manager.line.biz](https://manager.line.biz)** → Chat → Rich Menu:
 5. After deploy, open `https://<your-app>.onrender.com/ocr-status` — it should show
    `"available": true` and `"lang": "tha+eng"`.
 
+> **Why slip replies feel slow on the free plan:** Render's free tier spins
+> the service down after ~15 minutes of no traffic. The *next* message after
+> a spin-down pays a 30–60s cold-start before OCR even starts — OCR itself
+> runs in well under a second once the service is warm. To avoid this without
+> paying for Render's always-on plan, set up a free external cron
+> (e.g. [cron-job.org](https://cron-job.org) or
+> [UptimeRobot](https://uptimerobot.com)) to `GET https://<your-app>.onrender.com/health`
+> every 10 minutes, which keeps the service warm 24/7.
+
 ### Railway / any Docker host
 
 Build the included `Dockerfile` — no extra start command needed (it runs uvicorn
