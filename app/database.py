@@ -1,17 +1,14 @@
-import sqlite3
 import os
-from datetime import datetime
+import psycopg2
+import psycopg2.extras
+import psycopg2.errors
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "expenses.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 
-def get_connection() -> sqlite3.Connection:
-    """Return a connection to the SQLite database with row factory enabled."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+def get_connection() -> psycopg2.extensions.connection:
+    """Return a psycopg2 connection."""
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
@@ -19,44 +16,52 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
-    cursor.executescript("""
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             name        TEXT NOT NULL UNIQUE,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             user_id     TEXT NOT NULL,
             amount      REAL NOT NULL,
             category    TEXT NOT NULL,
             description TEXT DEFAULT '',
             image_url   TEXT DEFAULT '',
             source      TEXT DEFAULT 'slip',
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
 
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS pending_transactions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            id          SERIAL PRIMARY KEY,
             user_id     TEXT NOT NULL,
             amount      REAL NOT NULL,
             description TEXT DEFAULT '',
             image_url   TEXT DEFAULT '',
             state       TEXT NOT NULL DEFAULT 'awaiting_category',
             raw_ocr     TEXT DEFAULT '',
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-        );
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
     """)
 
     # Seed default categories if table is empty
-    existing = cursor.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM categories")
+    existing = cursor.fetchone()[0]
     if existing == 0:
         default_cats = ["Food", "Transport", "Bills", "Shopping", "Entertainment", "Health"]
         for cat in default_cats:
-            cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (cat,))
+            cursor.execute(
+                "INSERT INTO categories (name) VALUES (%s) ON CONFLICT DO NOTHING", (cat,)
+            )
 
     conn.commit()
+    cursor.close()
     conn.close()
 
 
@@ -68,23 +73,25 @@ def add_pending(user_id: str, amount: float, description: str, image_url: str,
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO pending_transactions (user_id, amount, description, image_url, state, raw_ocr)
-           VALUES (?, ?, ?, ?, 'awaiting_category', ?)""",
+           VALUES (%s, %s, %s, %s, 'awaiting_category', %s) RETURNING id""",
         (user_id, amount, description, image_url, raw_ocr),
     )
+    pending_id = cursor.fetchone()[0]
     conn.commit()
-    pending_id = cursor.lastrowid
+    cursor.close()
     conn.close()
     return pending_id
 
 
 def get_pending(user_id: str):
     conn = get_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cursor.execute(
-        "SELECT * FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT * FROM pending_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     )
     row = cursor.fetchone()
+    cursor.close()
     conn.close()
     return dict(row) if row else None
 
@@ -92,21 +99,22 @@ def get_pending(user_id: str):
 def update_pending_state(user_id: str, state: str) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
-    # Get the latest pending ID first (SQLite does not support ORDER BY in UPDATE)
     cursor.execute(
-        "SELECT id FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM pending_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     )
     row = cursor.fetchone()
     if not row:
+        cursor.close()
         conn.close()
         return False
     cursor.execute(
-        "UPDATE pending_transactions SET state = ? WHERE id = ?",
-        (state, row["id"]),
+        "UPDATE pending_transactions SET state = %s WHERE id = %s",
+        (state, row[0]),
     )
     conn.commit()
     updated = cursor.rowcount > 0
+    cursor.close()
     conn.close()
     return updated
 
@@ -114,18 +122,19 @@ def update_pending_state(user_id: str, state: str) -> bool:
 def delete_pending(user_id: str) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
-    # Get the latest pending ID first (SQLite does not support ORDER BY in DELETE on all versions)
     cursor.execute(
-        "SELECT id FROM pending_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+        "SELECT id FROM pending_transactions WHERE user_id = %s ORDER BY created_at DESC LIMIT 1",
         (user_id,),
     )
     row = cursor.fetchone()
     if not row:
+        cursor.close()
         conn.close()
         return False
-    cursor.execute("DELETE FROM pending_transactions WHERE id = ?", (row["id"],))
+    cursor.execute("DELETE FROM pending_transactions WHERE id = %s", (row[0],))
     conn.commit()
     deleted = cursor.rowcount > 0
+    cursor.close()
     conn.close()
     return deleted
 
@@ -137,20 +146,23 @@ def get_categories() -> list[str]:
     cursor = conn.cursor()
     cursor.execute("SELECT name FROM categories ORDER BY name")
     rows = cursor.fetchall()
+    cursor.close()
     conn.close()
-    return [row["name"] for row in rows]
+    return [row[0] for row in rows]
 
 
 def add_category(name: str) -> bool:
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO categories (name) VALUES (?)", (name.strip(),))
+        cursor.execute("INSERT INTO categories (name) VALUES (%s)", (name.strip(),))
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         return False
     finally:
+        cursor.close()
         conn.close()
 
 
@@ -163,11 +175,12 @@ def add_transaction(user_id: str, amount: float, category: str,
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO transactions (user_id, amount, category, description, image_url, source)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+           VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
         (user_id, amount, category, description, image_url, source),
     )
+    trans_id = cursor.fetchone()[0]
     conn.commit()
-    trans_id = cursor.lastrowid
+    cursor.close()
     conn.close()
     return trans_id
 
@@ -178,22 +191,46 @@ def get_monthly_total(user_id: str) -> float:
     cursor = conn.cursor()
     cursor.execute(
         """SELECT COALESCE(SUM(amount), 0) FROM transactions
-           WHERE user_id = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')""",
+           WHERE user_id = %s
+             AND TO_CHAR(created_at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM')
+               = TO_CHAR(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM')""",
         (user_id,),
     )
     total = cursor.fetchone()[0]
+    cursor.close()
     conn.close()
-    return total
+    return float(total)
 
 
 def get_all_transactions(user_id: str) -> list[dict]:
     """Return all transactions for the user, newest first."""
     conn = get_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cursor.execute(
-        "SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC",
+        "SELECT * FROM transactions WHERE user_id = %s ORDER BY created_at DESC",
         (user_id,),
     )
     rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_monthly_summary(user_id: str) -> list[dict]:
+    """Return per-category totals for the current month."""
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor.execute(
+        """SELECT category, SUM(amount) AS total, COUNT(*) AS count
+           FROM transactions
+           WHERE user_id = %s
+             AND TO_CHAR(created_at AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM')
+               = TO_CHAR(NOW() AT TIME ZONE 'Asia/Bangkok', 'YYYY-MM')
+           GROUP BY category
+           ORDER BY total DESC""",
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
     conn.close()
     return [dict(r) for r in rows]

@@ -184,8 +184,9 @@ def _handle_edit_command(user_id: str, reply_token: str, match: re.Match):
     new_amount = float(match.group(1))
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute("UPDATE pending_transactions SET amount = ? WHERE id = ?", (new_amount, pending["id"]))
+    cursor.execute("UPDATE pending_transactions SET amount = %s WHERE id = %s", (new_amount, pending["id"]))
     conn.commit()
+    cursor.close()
     conn.close()
     cats = db.get_categories()
     qr = build_category_quick_reply(cats)
@@ -216,16 +217,7 @@ def _handle_recent(user_id: str, reply_token: str):
 
 def _handle_summary(user_id: str, reply_token: str):
     monthly = db.get_monthly_total(user_id)
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """SELECT category, SUM(amount) as total, COUNT(*) as count FROM transactions
-           WHERE user_id = ? AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
-           GROUP BY category ORDER BY total DESC""",
-        (user_id,),
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    rows = db.get_monthly_summary(user_id)
     if not rows:
         _reply(reply_token, [TextMessage(text="📭 No transactions.")])
         return
