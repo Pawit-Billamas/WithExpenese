@@ -15,27 +15,40 @@ Strategy (robust, Thai-aware):
         Pass 3: number followed by "บาท"
         Pass 4: largest plausible decimal as a fallback
 """
+import os
 import re
 import io
 import shutil
+
+# Always defined so get_status() never has to guess.
+TESSERACT_AVAILABLE = False
+OCR_LANG = "eng"
+_SETUP_ERROR = ""
+_LANGS = set()
 
 try:
     from PIL import Image, ImageEnhance, ImageFilter
     import pytesseract
 
-    # Find tesseract binary:
-    #   - Render/Linux installs it at /usr/bin/tesseract
-    #   - Windows default install path is used as a fallback
-    _tess = (
-        shutil.which("tesseract")
-        or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        or "/usr/bin/tesseract"
-    )
-    pytesseract.pytesseract.tesseract_cmd = _tess
+    # Locate the tesseract binary. On Render/Docker it is on PATH at
+    # /usr/bin/tesseract; on Windows we fall back to the default install dir.
+    _tess = shutil.which("tesseract")
+    if not _tess:
+        for _candidate in (
+            "/usr/bin/tesseract",
+            "/usr/local/bin/tesseract",
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        ):
+            if os.path.exists(_candidate):
+                _tess = _candidate
+                break
+    if _tess:
+        pytesseract.pytesseract.tesseract_cmd = _tess
 
+    # This raises if the binary is missing/unreadable.
     _version = pytesseract.get_tesseract_version()
 
-    # Detect installed languages so we can choose tha+eng vs eng safely
+    # Detect installed languages so we choose tha+eng only when Thai exists.
     try:
         _LANGS = set(pytesseract.get_languages(config=""))
     except Exception:
@@ -43,13 +56,13 @@ try:
     OCR_LANG = "tha+eng" if "tha" in _LANGS else "eng"
 
     TESSERACT_AVAILABLE = True
-    print(f"[OCR] Tesseract {_version} ready at: {_tess} | lang={OCR_LANG}")
+    print(f"[OCR] Tesseract {_version} ready at: {_tess} | lang={OCR_LANG} | langs={sorted(_LANGS)[:5]}...")
 
 except Exception as _e:
     TESSERACT_AVAILABLE = False
     OCR_LANG = "eng"
-    _SETUP_ERROR = str(_e)
-    print(f"[OCR] Tesseract NOT available: {_e}")
+    _SETUP_ERROR = f"{type(_e).__name__}: {_e}"
+    print(f"[OCR] Tesseract NOT available: {_SETUP_ERROR}")
 
 
 # ── Image preprocessing ───────────────────────────────────────────────
@@ -240,5 +253,9 @@ def get_status() -> dict:
             "version": str(pytesseract.get_tesseract_version()),
             "lang": OCR_LANG,
         }
-    return {"available": False,
-            "error": _SETUP_ERROR if "_SETUP_ERROR" in dir() else "unknown"}
+    return {
+        "available": False,
+        "error": _SETUP_ERROR or "Tesseract binary not found on the server.",
+        "lang": OCR_LANG,
+        "langs_found": sorted(_LANGS),
+    }

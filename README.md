@@ -110,19 +110,35 @@ In **[manager.line.biz](https://manager.line.biz)** → Chat → Rich Menu:
 
 ## Deployment Options
 
-### Render
+> **Important:** OCR needs the **Tesseract binary** (with the Thai pack), which
+> `pip` cannot install. A plain Python web service on Render therefore reports
+> `/ocr-status` → `{"available": false}`. Deploy with the included **Dockerfile**
+> so the Thai-enabled Tesseract is installed in the image. The build/run happens
+> entirely on the host's cloud — your PC is only needed for the one-time push.
 
-1. Push to GitHub
-2. Create a **Web Service** on render.com
-3. Set **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-4. Add all env vars in the Render dashboard
+### Render (Docker — recommended)
 
-### Railway
+1. Push to GitHub (the repo already contains a `Dockerfile` and `render.yaml`).
+2. On render.com create a **Web Service** from this repo.
+3. Set **Runtime / Environment = Docker** (Render auto-detects the `Dockerfile`).
+   If the service was previously "Python", change it to Docker (or recreate it),
+   then **Clear build cache & deploy**.
+4. Add env vars: `LINE_CHANNEL_SECRET`, `LINE_CHANNEL_ACCESS_TOKEN`,
+   `MONTHLY_BUDGET`, `DATABASE_URL`.
+5. After deploy, open `https://<your-app>.onrender.com/ocr-status` — it should show
+   `"available": true` and `"lang": "tha+eng"`.
 
-1. Push to GitHub
-2. Create a new project on railway.app
-3. Set **Start Command**: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-4. Add env vars
+### Railway / any Docker host
+
+Build the included `Dockerfile` — no extra start command needed (it runs uvicorn
+on `$PORT`). Add the same env vars.
+
+### Run the Docker image locally (optional)
+
+```bash
+docker build -t withexpense .
+docker run -p 8000:8000 --env-file .env withexpense
+```
 
 ---
 
