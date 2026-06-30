@@ -1,6 +1,6 @@
 # Personal Expense Tracker LINE Bot
 
-Send payment slip photos to a LINE bot → OCR reads the amount → pick a category → it's logged. Built with **FastAPI**, **SQLite**, and **OpenRouter Vision API**.
+Send payment slip photos to a LINE bot → OCR reads the amount → pick a category → it's logged. Built with **FastAPI**, **PostgreSQL/SQLite**, and **Tesseract OCR** (free, runs locally — no API key or tokens).
 
 ---
 
@@ -24,7 +24,9 @@ Send payment slip photos to a LINE bot → OCR reads the amount → pick a categ
 
 1. **Python 3.10+** installed
 2. **LINE Developer account** — [developers.line.biz](https://developers.line.biz)
-3. **OpenRouter API key** — [openrouter.ai](https://openrouter.ai/keys)
+3. **Tesseract OCR** installed with the Thai language pack (`tha`) — free, no API key
+   - Windows: install [Tesseract at UB Mannheim](https://github.com/UB-Mannheim/tesseract/wiki) and select the **Thai** language during setup
+   - Debian/Ubuntu/Render: `apt-get install -y tesseract-ocr tesseract-ocr-tha`
 4. **Public HTTPS URL** — for LINE webhook (use [ngrok](https://ngrok.com) or deploy to Render/Railway)
 
 ---
@@ -47,7 +49,6 @@ Copy `.env.example` to `.env` and fill in your credentials:
 ```env
 LINE_CHANNEL_SECRET=your_channel_secret_here
 LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token_here
-OPENROUTER_API_KEY=your_openrouter_api_key_here
 MONTHLY_BUDGET=20000
 ```
 
@@ -135,7 +136,7 @@ e:\Projects\LineBot\
 │   ├── config.py            # Environment variable loader
 │   ├── database.py          # SQLite models & helpers
 │   ├── line_handlers.py     # LINE event handlers & bot logic
-│   └── ocr_service.py       # OpenRouter vision API client
+│   └── ocr_service.py       # Tesseract OCR + Thai amount extraction (local, free)
 ├── .env                     # Your secrets (git-ignored)
 ├── .env.example             # Template for env vars
 ├── requirements.txt
@@ -149,10 +150,9 @@ e:\Projects\LineBot\
 | Component | Choice |
 |-----------|--------|
 | Framework | FastAPI (async) |
-| Database | SQLite (zero-config) |
+| Database | PostgreSQL (pg8000) / SQLite |
 | LINE SDK | line-bot-sdk-python v3 |
-| Vision OCR | Gemini 2.5 Flash via OpenRouter |
-| Image Hosting | 0x0.st (temp) |
+| OCR | Tesseract (`tha+eng`) — local, free, no tokens |
 | Deployment | Render / Railway / any VPS |
 
 ---

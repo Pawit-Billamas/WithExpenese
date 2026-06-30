@@ -32,5 +32,6 @@ Thumbs.db
 
 # Test files
 test_*.py
+test_slips/
 add_tesseract_path.ps1
 install_all.ps1

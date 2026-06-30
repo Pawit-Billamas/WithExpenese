@@ -3,7 +3,7 @@ services:
     name: withexpenese
     env: python
     plan: free
-    buildCommand: apt-get update -y && apt-get install -y tesseract-ocr && pip install -r requirements.txt
+    buildCommand: apt-get update -y && apt-get install -y tesseract-ocr tesseract-ocr-tha && pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: LINE_CHANNEL_SECRET
