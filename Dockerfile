@@ -15,8 +15,11 @@ RUN apt-get update -y \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Tesseract language data location (Debian default)
-ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+# Fail the build loudly if Tesseract or the Thai pack didn't install, so we
+# never deploy an image that silently can't read slips.
+RUN tesseract --version \
+    && tesseract --list-langs \
+    && tesseract --list-langs 2>&1 | grep -qx tha
 
 WORKDIR /app
 

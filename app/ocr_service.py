@@ -175,20 +175,22 @@ def _extract_amount(text: str):
             if val is not None:
                 return val
 
-    # Pass 4: largest plausible number as a fallback (prefer X.XX decimals)
-    decimals, integers = [], []
-    for m in re.finditer(r"\b(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b", text):
+    # Pass 4: largest plausible DECIMAL as a fallback.
+    # IMPORTANT: a Thai slip amount is ALWAYS a decimal like 100.00 / 200.00.
+    # Bare integers are account numbers (7515, 2979), reference numbers
+    # (06494) or dates — never the amount. So we ONLY accept X.XX values here.
+    # This is what prevents the "515 / 7515" misread.
+    decimals = []
+    for m in re.finditer(r"(?<!\d)(\d{1,3}(?:,\d{3})*\.\d{2})(?!\d)", text):
         raw = m.group(1).replace(",", "")
         if raw in fee_amounts:
             continue
         val = _parse_number(raw)
-        if val is None:
-            continue
-        (decimals if "." in raw else integers).append(val)
+        if val is not None:
+            decimals.append(val)
     if decimals:
         return max(decimals)
-    if integers:
-        return max(integers)
+
     return None
 
 
